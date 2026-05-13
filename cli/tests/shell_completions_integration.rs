@@ -565,6 +565,96 @@ echo "COMPLETION_TEST_DONE"
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+/// Regression test for https://github.com/jdx/usage/issues/634
+///
+/// `usage complete-word --shell zsh` emits two tab-separated columns per
+/// match — `<display>\t<insert>` — and the generated completion script feeds
+/// those to `_describe ... -U -Q -S ''` so values with spaces are inserted
+/// with consistent single-quote quoting (e.g. `'Alice Alice'`) instead of
+/// zsh's default mix of backslash and single-quote styles.
+#[test]
+fn test_zsh_completion_quotes_choices_with_spaces() {
+    if skip_if_shell_missing("zsh") {
+        return;
+    }
+
+    let usage_bin = build_usage_binary();
+
+    let temp_dir = env::temp_dir().join(format!(
+        "usage_zsh_choices_quote_test_{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let spec = r#"
+arg "<course>" required {
+  choices "A B & C"
+}
+arg "<recipient>" required {
+  choices "Alice Alice" "Bob Bob" "Carol Carol"
+}
+"#;
+    let spec_kdl_file = temp_dir.join("testcli.kdl");
+    fs::write(&spec_kdl_file, spec).unwrap();
+
+    // 1. The raw `complete-word --shell zsh` output for the recipient arg
+    //    should be tab-separated, with the insert column pre-quoted.
+    let raw = Command::new(&usage_bin)
+        .args(["complete-word", "--shell", "zsh", "-f"])
+        .arg(spec_kdl_file.to_str().unwrap())
+        .args(["--", "testcli", "A B & C", ""])
+        .output()
+        .expect("Failed to run complete-word");
+    let raw_stdout = String::from_utf8_lossy(&raw.stdout);
+    let expected_lines = [
+        "Alice Alice\t'Alice Alice'",
+        "Bob Bob\t'Bob Bob'",
+        "Carol Carol\t'Carol Carol'",
+    ];
+    for line in expected_lines {
+        assert!(
+            raw_stdout.lines().any(|l| l == line),
+            "Expected `{line}` in complete-word output, got:\n{raw_stdout}"
+        );
+    }
+
+    // 2. The simple unquoted case still emits a tab + the raw value as the
+    //    insert column (no surrounding quotes).
+    let raw_simple = Command::new(&usage_bin)
+        .args(["complete-word", "--shell", "zsh", "-s"])
+        .arg(r#"arg "<env>" { choices "dev" "prod" }"#)
+        .args(["--", "testcli", ""])
+        .output()
+        .expect("Failed to run complete-word");
+    let simple_stdout = String::from_utf8_lossy(&raw_simple.stdout);
+    assert!(
+        simple_stdout.lines().any(|l| l == "dev\tdev"),
+        "Expected `dev\\tdev` in complete-word output, got:\n{simple_stdout}"
+    );
+
+    // 3. The generated zsh completion script wires these two columns into
+    //    `_describe` with `-U -Q` so zsh inserts the pre-quoted value verbatim.
+    let gen = Command::new(&usage_bin)
+        .args(["generate", "completion", "zsh", "testcli", "-f"])
+        .arg(spec_kdl_file.to_str().unwrap())
+        .output()
+        .expect("Failed to generate zsh completion");
+    let script = String::from_utf8_lossy(&gen.stdout);
+    let expected_fragments = [
+        "(Q)words",                                          // unquote user input
+        r#"IFS=$'\t' read -r display insert"#,               // tab-separated
+        "_describe 'completions' completions inserts -U -Q", // -U -Q on _describe
+    ];
+    for fragment in expected_fragments {
+        assert!(
+            script.contains(fragment),
+            "Expected `{fragment}` in generated script:\n{script}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 #[test]
 fn test_powershell_completion_integration() {
     if skip_if_shell_missing("pwsh") {
@@ -726,19 +816,23 @@ cmd other help="Another subcommand"
     let spec_file = temp_dir.join("test.spec");
     fs::write(&spec_file, usage_spec).unwrap();
 
-    // Test zsh output format: should be `name:description` for _describe
+    // Test zsh output format: each line is `<display>\t<insert>` where
+    // <display> is `name:description` (or `name`) for `_describe`'s menu
+    // rendering, and <insert> is the shell-quoted form to insert verbatim
+    // via `compadd -Q`.
     let output = run_complete_word(&usage_bin, "zsh", &spec_file, &["testcli", ""]);
     let lines: Vec<&str> = output.lines().collect();
 
-    // Should have completions with description format "name:description"
     assert!(
-        lines.iter().any(|l| l.contains("sub:A subcommand")),
-        "Expected 'sub:A subcommand' in zsh output, got: {:?}",
+        lines.iter().any(|l| *l == "sub:A subcommand\tsub"),
+        "Expected 'sub:A subcommand\\tsub' in zsh output, got: {:?}",
         lines
     );
     assert!(
-        lines.iter().any(|l| l.contains("other:Another subcommand")),
-        "Expected 'other:Another subcommand' in zsh output, got: {:?}",
+        lines
+            .iter()
+            .any(|l| *l == "other:Another subcommand\tother"),
+        "Expected 'other:Another subcommand\\tother' in zsh output, got: {:?}",
         lines
     );
 

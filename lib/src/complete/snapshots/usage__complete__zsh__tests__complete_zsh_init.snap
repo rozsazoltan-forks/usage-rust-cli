@@ -19,12 +19,15 @@ _usage_default_complete() {
         local first
         if IFS= read -r first < "$cmdpath" 2>/dev/null && [[ "$first" == "#!"*"usage"* ]]; then
             if (( ${+commands[usage]} )); then
-                local -a completions=()
-                local line
-                while IFS= read -r line; do
-                    completions+=("$line")
-                done < <(command usage complete-word --shell zsh -f "$cmdpath" --cword=$((CURRENT - 1)) -- "${words[@]}")
-                _describe 'completions' completions -S ''
+                local -a completions=() inserts=()
+                local needs_menu=0 display insert
+                while IFS=$'\t' read -r display insert; do
+                  completions+=("$display")
+                  inserts+=("$insert")
+                  [[ "$insert" == "'"* ]] && needs_menu=1
+                done < <(command usage complete-word --shell zsh -f "$cmdpath" --cword=$((CURRENT - 1)) -- "${(Q)words[@]}")
+                (( needs_menu )) && compstate[insert]=menu
+                _describe 'completions' completions inserts -U -Q -S ''
                 return $?
             fi
         fi
