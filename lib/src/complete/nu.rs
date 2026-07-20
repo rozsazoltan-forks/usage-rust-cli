@@ -26,11 +26,22 @@ pub fn complete_nu(opts: &CompleteOptions) -> String {
         out.push(format!("    const {spec_variable} = r##'{spec}'##"));
     }
 
+    // The cache filename is version-keyed and the cache dir is now persistent
+    // (unlike the reboot-cleared temp dir), so old versions would accumulate
+    // forever. On a cache miss, reap this bin's spec files not regenerated in
+    // the last 30 days. Age-based (not "delete all other versions") so that
+    // running two versions of the same tool concurrently doesn't thrash — each
+    // live version's spec stays recent and survives.
+    let prune_stale = format!(
+        r#"glob ($spec_dir | path join "usage__usage_spec_{bin_snake}_*.spec") | each {{|f| if ((ls $f | get 0.modified) < ((date now) - 30day)) {{ rm --force $f }} }} | ignore"#
+    );
+
     // Build logic to write spec directly to file without storing in shell variables
     let file_write_logic = if let Some(usage_cmd) = &opts.usage_cmd {
         if opts.cache_key.is_some() {
             format!(
                 r#"if not ($spec_file | path exists) {{
+            {prune_stale}
             ^{usage_cmd} | collect | save $spec_file
         }}"#
             )
@@ -41,6 +52,7 @@ pub fn complete_nu(opts: &CompleteOptions) -> String {
         if opts.cache_key.is_some() {
             format!(
                 r#"if not ($spec_file | path exists) {{
+            {prune_stale}
             ${spec_variable} | save $spec_file
         }}"#
             )
@@ -54,7 +66,9 @@ pub fn complete_nu(opts: &CompleteOptions) -> String {
     out.push(
         format!(
             r#"    def {bin_snake}_completer [spans: list<string>] {{
-        let spec_file = $"($nu.temp-dir)/usage_{spec_variable}.spec"
+        let spec_dir = ($env.XDG_CACHE_HOME? | default ($nu.home-path | path join ".cache") | path join "usage")
+        mkdir $spec_dir
+        let spec_file = ($spec_dir | path join $"usage_{spec_variable}.spec")
         {file_write_logic}
 
         (^{usage_bin} complete-word -f $spec_file --shell nu -- ...$spans)
